@@ -19,6 +19,10 @@ package org.immutables.criteria.personmodel;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+
+import java.util.List;
+import java.util.Optional;
+
 import org.immutables.criteria.Criteria;
 import org.immutables.value.Value;
 
@@ -37,4 +41,8 @@ public interface Pet {
   String name();
 
   PetType type();
+
+  Optional<Address> address();
+
+  List<Toy> toys();
 }

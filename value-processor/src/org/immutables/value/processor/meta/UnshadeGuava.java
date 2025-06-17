@@ -19,6 +19,10 @@ import com.google.common.base.MoreObjects;
 import javax.annotation.Nullable;
 
 public final class UnshadeGuava {
+  // hiding default prefix from accidental shading (via .concat)
+  // i.e. shading tools can mangle string constants which have fully qualified name prefix
+  // of the package which is going to be relocated. We use this for Guava, as we use it
+  // internally and shade it.
   private static final String GUAVA_PREFIX =
       System.getProperty("guava.prefix", "com.go".concat("ogle.common"));
 
@@ -28,7 +32,7 @@ public final class UnshadeGuava {
     prefixOverride = prefix;
   }
 
-  public static String typeString(String partiallyQualifiedType) {
+  public static String qualify(String partiallyQualifiedType) {
     return prefix() + '.' + partiallyQualifiedType;
   }
 

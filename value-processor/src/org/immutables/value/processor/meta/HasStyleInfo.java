@@ -17,4 +17,17 @@ package org.immutables.value.processor.meta;
 
 public interface HasStyleInfo {
   StyleInfo style();
+  FallbackNullableKind fallbackNullableKind();
+
+  enum FallbackNullableKind {
+    UNSPECIFIED,
+    SPECIFIED,
+    SPECIFIED_TYPEUSE,
+    JSPECIFY,
+    ;
+
+    boolean isTypeuse() {
+      return this == SPECIFIED_TYPEUSE || this == JSPECIFY;
+    }
+  }
 }

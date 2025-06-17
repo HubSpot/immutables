@@ -24,8 +24,11 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Interner;
 import com.google.common.collect.Interners;
-import com.google.common.collect.Lists;
 import com.google.common.collect.ObjectArrays;
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -50,6 +53,7 @@ import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 import javax.lang.model.util.ElementFilter;
+import javax.lang.model.util.Elements;
 import javax.tools.Diagnostic;
 import org.immutables.generator.ClasspathFence;
 import org.immutables.generator.EnvironmentState;
@@ -63,7 +67,6 @@ import org.immutables.value.processor.encode.Instantiator;
 import org.immutables.value.processor.encode.Type;
 import org.immutables.value.processor.meta.AnnotationInjections.AnnotationInjection;
 import org.immutables.value.processor.meta.AnnotationInjections.InjectionInfo;
-import org.immutables.value.processor.meta.BuilderMirrors.FBuilder;
 import org.immutables.value.processor.meta.Reporter.About;
 import org.immutables.value.processor.meta.Styles.UsingName.TypeNames;
 import static com.google.common.base.Verify.verify;
@@ -83,6 +86,7 @@ public class Proto {
   private static class TypeFactoryAndInflater implements Runnable {
     final Type.Factory factory = new Type.Producer();
     final Inflater inflater = new Inflater(factory);
+
     @Override public void run() {}
   }
 
@@ -266,6 +270,7 @@ public class Proto {
 
   private static class MetaAnnotatedCache implements Runnable {
     final ConcurrentMap<String, MetaAnnotated> cache = new ConcurrentHashMap<>(16, 0.7f, 1);
+
     @Override public void run() {
       // these clear() calls are not strictly necessary, just subject to GC after processing or round
       // but we try to be "paranoidaly consistent"
@@ -342,13 +347,13 @@ public class Proto {
      * {@code base.MoreObjects} then {@code base.Objects}.
      * Return {@code null} if not found.
      * @return full class name for Guava's {@code MoreObjects} / {@code Objects} or {@code null} if
-     *         such class doesn't exists in classpath
+     *     such class doesn't exist in classpath
      */
     @Nullable
     @Value.Lazy
     String typeMoreObjects() {
       for (String shortName : Arrays.asList("base.MoreObjects", "base.Objects")) {
-        final String name = UnshadeGuava.typeString(shortName);
+        final String name = UnshadeGuava.qualify(shortName);
         if (hasElement(name)) {
           return name;
         }
@@ -370,7 +375,7 @@ public class Proto {
     public boolean hasGsonLib() {
       return hasElement("com.google.gson.Gson");
     }
-    
+
     @Value.Lazy
     public boolean hasDatatypesModule() {
       return hasElement(DataMirror.qualifiedName());
@@ -505,8 +510,10 @@ public class Proto {
     private final Map<Set<EncodingInfo>, Instantiator> instantiators = new HashMap<>();
 
     Instantiator instantiatorFor(Set<EncodingInfo> encodings) {
-      return instantiators.computeIfAbsent(encodings,
-          key -> typeFactoryAndInflater().inflater.instantiatorFor(key));
+      Inflater inflater = typeFactoryAndInflater().inflater;
+      synchronized (instantiators) {
+        return instantiators.computeIfAbsent(encodings, inflater::instantiatorFor);
+      }
     }
 
     public boolean isCheckedException(TypeMirror throwable) {
@@ -518,6 +525,45 @@ public class Proto {
       return new CheckedExceptionProbe(
           processing().getTypeUtils(),
           processing().getElementUtils());
+    }
+
+    private final Map<String, Boolean> whetherTypeuseOnly = new HashMap<>(1);
+
+    public boolean isTypeuseOnly(String annotation) {
+      synchronized (whetherTypeuseOnly) {
+        // don't want to run computation inside computeIfAbsent lambda
+        @Nullable Boolean is = whetherTypeuseOnly.get(annotation);
+        if (is == null) {
+          is = determineIfUnambiguousTypeuse(annotation);
+          whetherTypeuseOnly.put(annotation, is);
+        }
+        return is;
+      }
+    }
+
+    private boolean determineIfUnambiguousTypeuse(String annotationClassName) {
+      TypeElement annotationTypeElement = processing().getElementUtils().getTypeElement(annotationClassName);
+      @Nullable Target targetAnnotation = annotationTypeElement.getAnnotation(Target.class);
+      if (targetAnnotation == null) {
+        // annotation can be used anywhere
+        return false;
+      }
+      boolean isTypeUse = false;
+      for (ElementType elementType : targetAnnotation.value()) {
+        switch (elementType) {
+          case LOCAL_VARIABLE:
+          case PARAMETER:
+          case FIELD:
+          case METHOD:
+            // these might conflict with TYPE_USE
+            return false;
+          case TYPE_USE:
+            isTypeUse = true;
+            continue;
+          default: // skip
+        }
+      }
+      return isTypeUse;
     }
   }
 
@@ -861,9 +907,8 @@ public class Proto {
     @Override
     @Value.Lazy
     public boolean isJacksonSerialized() {
-      boolean isJacksonSerialized = super.isJacksonSerialized();
-      if (isJacksonSerialized) {
-        return isJacksonSerialized;
+      if (super.isJacksonSerialized()) {
+        return true;
       }
       Optional<DeclaringPackage> parent = namedParentPackage();
       if (parent.isPresent()) {
@@ -966,7 +1011,7 @@ public class Proto {
       }
       super.collectEncodings(encodings);
     }
-    
+
     @Override
     @Value.Lazy
     public Optional<DataMirror> datatypeEnabled() {
@@ -980,6 +1025,54 @@ public class Proto {
       }
       return Optional.absent();
     }
+
+    @Value.Lazy
+    public boolean isJSpecifyNullMarked() {
+      if (JSpecifyNullMarkedMirror.isPresent(element())) {
+        return true;
+      }
+
+      @Nullable Element module = getModule();
+      if (module != null && JSpecifyNullMarkedMirror.isPresent(module)) {
+        return true;
+      }
+      // let's also check parent packages
+      String parentPackageName = SourceNames.parentPackageName(element());
+      while (!parentPackageName.isEmpty()) {
+        @Nullable PackageElement parentPackage = environment().processing()
+            .getElementUtils()
+            .getPackageElement(parentPackageName);
+        if (parentPackage != null && JSpecifyNullMarkedMirror.isPresent(parentPackage)) {
+          return true;
+        }
+        parentPackageName = SourceNames.parentPackageName(parentPackageName);
+      }
+      return false;
+    }
+
+    private @Nullable Element getModule() {
+      if (getModuleOf != null) {
+        try {
+          return (Element) getModuleOf.invoke(processing().getElementUtils(), element());
+        } catch (InvocationTargetException | IllegalAccessException e) {
+          return null;
+        }
+      }
+      return null;
+    }
+  }
+
+  // we're still on Java8 language level, getModuleOf is 9+
+  // just avoiding compiler/linter problems
+  private static final @Nullable Method getModuleOf;
+  static {
+    Method method;
+    try {
+      method = Elements.class.getMethod("getModuleOf", Element.class);
+    } catch (NoSuchMethodException e) {
+      method = null;
+    }
+    getModuleOf = method;
   }
 
   @Value.Immutable
@@ -1074,6 +1167,11 @@ public class Proto {
       }
 
       return Optional.absent();
+    }
+
+    @Value.Lazy
+    public boolean isJSpecifyNullMarked() {
+      return JSpecifyNullMarkedMirror.isPresent(element());
     }
 
     @Value.Lazy
@@ -1451,7 +1549,7 @@ public class Proto {
           ? Optional.<AbstractDeclaring>of(typeDefining.get())
           : Optional.<AbstractDeclaring>absent();
     }
-    
+
     @Value.Lazy
     public Optional<DataMirror> datatypeMarker() {
       Optional<AbstractDeclaring> provider = datatypeProvider();
@@ -1540,6 +1638,22 @@ public class Proto {
         }
       }
       return packageOf().serialVersion();
+    }
+
+    @Value.Lazy
+    public boolean isJSpecifyNullMarked() {
+      if (declaringType().isPresent()) {
+        DeclaringType t = declaringType().get();
+        if (t.isJSpecifyNullMarked()) {
+          return true;
+        }
+        if (t.enclosingTopLevel().isPresent()) {
+          if (t.enclosingTopLevel().get().isJSpecifyNullMarked()) {
+            return true;
+          }
+        }
+      }
+      return packageOf().isJSpecifyNullMarked();
     }
 
     @Value.Lazy
@@ -1694,6 +1808,14 @@ public class Proto {
     @Value.Auxiliary
     public Optional<DeclaringType> enclosingOf() {
       if (declaringType().isPresent()) {
+        // this should come before isFactory check, bogus, I know
+        if (kind().isNestedFactoryOrConstructor()) {
+          Optional<DeclaringType> enclosingOf = declaringType().get().enclosingOf();
+          if (!enclosingOf.isPresent() && kind().isFactory()) {
+            return declaringType();
+          }
+          return enclosingOf;
+        }
         if (kind().isFactory()) {
           return declaringType();
         }
@@ -1739,43 +1861,43 @@ public class Proto {
 
       public boolean isNested() {
         switch (this) {
-        case INCLUDED_IN_TYPE:
-        case DEFINED_NESTED_TYPE:
-          return true;
-        default:
-          return false;
+          case INCLUDED_IN_TYPE:
+          case DEFINED_NESTED_TYPE:
+            return true;
+          default:
+            return false;
         }
       }
 
       public boolean isNestedFactoryOrConstructor() {
         switch (this) {
-        case DEFINED_NESTED_FACTORY:
-        case DEFINED_NESTED_CONSTRUCTOR:
-        case DEFINED_NESTED_RECORD:
-          return true;
-        default:
-          return false;
+          case DEFINED_NESTED_FACTORY:
+          case DEFINED_NESTED_CONSTRUCTOR:
+          case DEFINED_NESTED_RECORD:
+            return true;
+          default:
+            return false;
         }
       }
 
       public boolean isIncluded() {
         switch (this) {
-        case INCLUDED_IN_PACKAGE:
-        case INCLUDED_IN_TYPE:
-        case INCLUDED_ON_TYPE:
-          return true;
-        default:
-          return false;
+          case INCLUDED_IN_PACKAGE:
+          case INCLUDED_IN_TYPE:
+          case INCLUDED_ON_TYPE:
+            return true;
+          default:
+            return false;
         }
       }
 
       public boolean isEnclosing() {
         switch (this) {
-        case DEFINED_AND_ENCLOSING_TYPE:
-        case DEFINED_ENCLOSING_TYPE:
-          return true;
-        default:
-          return false;
+          case DEFINED_AND_ENCLOSING_TYPE:
+          case DEFINED_ENCLOSING_TYPE:
+            return true;
+          default:
+            return false;
         }
       }
 
@@ -1785,28 +1907,28 @@ public class Proto {
 
       public boolean isValue() {
         switch (this) {
-        case INCLUDED_IN_PACKAGE:
-        case INCLUDED_ON_TYPE:
-        case INCLUDED_IN_TYPE:
-        case DEFINED_TYPE:
-        case DEFINED_TYPE_AND_COMPANION:
-        case DEFINED_AND_ENCLOSING_TYPE:
-        case DEFINED_NESTED_TYPE:
-          return true;
-        default:
-          return false;
+          case INCLUDED_IN_PACKAGE:
+          case INCLUDED_ON_TYPE:
+          case INCLUDED_IN_TYPE:
+          case DEFINED_TYPE:
+          case DEFINED_TYPE_AND_COMPANION:
+          case DEFINED_AND_ENCLOSING_TYPE:
+          case DEFINED_NESTED_TYPE:
+            return true;
+          default:
+            return false;
         }
       }
 
       public boolean isDefinedValue() {
         switch (this) {
-        case DEFINED_TYPE:
-        case DEFINED_TYPE_AND_COMPANION:
-        case DEFINED_AND_ENCLOSING_TYPE:
-        case DEFINED_NESTED_TYPE:
-          return true;
-        default:
-          return false;
+          case DEFINED_TYPE:
+          case DEFINED_TYPE_AND_COMPANION:
+          case DEFINED_AND_ENCLOSING_TYPE:
+          case DEFINED_NESTED_TYPE:
+            return true;
+          default:
+            return false;
         }
       }
 
@@ -1817,44 +1939,44 @@ public class Proto {
 
       public boolean isConstructor() {
         switch (this) {
-        case DEFINED_CONSTRUCTOR:
-        case INCLUDED_CONSTRUCTOR_IN_PACKAGE:
-        case INCLUDED_CONSTRUCTOR_ON_TYPE:
-          return true;
-        default:
-          return false;
+          case DEFINED_CONSTRUCTOR:
+          case INCLUDED_CONSTRUCTOR_IN_PACKAGE:
+          case INCLUDED_CONSTRUCTOR_ON_TYPE:
+            return true;
+          default:
+            return false;
         }
       }
 
       public boolean isFactoryNotNested() {
         switch (this) {
-        case DEFINED_FACTORY:
-        case INCLUDED_FACTORY_IN_PACKAGE:
-        case INCLUDED_FACTORY_ON_TYPE:
-        case DEFINED_CONSTRUCTOR:
-        case INCLUDED_CONSTRUCTOR_IN_PACKAGE:
-        case INCLUDED_CONSTRUCTOR_ON_TYPE:
-          return true;
-        default:
-          return false;
+          case DEFINED_FACTORY:
+          case INCLUDED_FACTORY_IN_PACKAGE:
+          case INCLUDED_FACTORY_ON_TYPE:
+          case DEFINED_CONSTRUCTOR:
+          case INCLUDED_CONSTRUCTOR_IN_PACKAGE:
+          case INCLUDED_CONSTRUCTOR_ON_TYPE:
+            return true;
+          default:
+            return false;
         }
       }
 
       public boolean isFactory() {
         switch (this) {
-        case DEFINED_FACTORY:
-        case DEFINED_NESTED_FACTORY:
-        case INCLUDED_FACTORY_IN_PACKAGE:
-        case INCLUDED_FACTORY_ON_TYPE:
-        case DEFINED_CONSTRUCTOR:
-        case DEFINED_RECORD:
-        case DEFINED_NESTED_RECORD:
-        case DEFINED_NESTED_CONSTRUCTOR:
-        case INCLUDED_CONSTRUCTOR_IN_PACKAGE:
-        case INCLUDED_CONSTRUCTOR_ON_TYPE:
-          return true;
-        default:
-          return false;
+          case DEFINED_FACTORY:
+          case DEFINED_NESTED_FACTORY:
+          case INCLUDED_FACTORY_IN_PACKAGE:
+          case INCLUDED_FACTORY_ON_TYPE:
+          case DEFINED_CONSTRUCTOR:
+          case DEFINED_RECORD:
+          case DEFINED_NESTED_RECORD:
+          case DEFINED_NESTED_CONSTRUCTOR:
+          case INCLUDED_CONSTRUCTOR_IN_PACKAGE:
+          case INCLUDED_CONSTRUCTOR_ON_TYPE:
+            return true;
+          default:
+            return false;
         }
       }
 
@@ -1943,22 +2065,13 @@ public class Proto {
       return isJacksonSerialized();
     }
 
-    private List<String> debugLines = ImmutableList.of();
-
-    // This is not part of the logical structure of the protoclass
-    // but it seems that this is the best place to have this info
     Protoclass debug(String line) {
-      if (!DEBUG_ON)
-        return this;
-      if (debugLines.isEmpty()) {
-        debugLines = Lists.newArrayList();
-      }
-      debugLines.add(line);
+      environment().round().debug(line);
       return this;
     }
 
     List<String> getDebugLines() {
-      return debugLines;
+      return environment().round().getDebugLines();
     }
   }
 
@@ -2053,13 +2166,11 @@ public class Proto {
     return ObjectArrays.concat(first, second, String.class);
   }
 
-  private static final boolean DEBUG_ON = false;
-
   static final String ORDINAL_VALUE_INTERFACE_TYPE = "org.immutables.ordinal.OrdinalValue";
-  static final String JACKSON_TYPE_INFO = "com.fasterxml.jackson.annotation.JsonTypeInfo";
-  static final String JACKSON_DESERIALIZE = "com.fasterxml.jackson.databind.annotation.JsonDeserialize";
-  static final String JACKSON_SERIALIZE = "com.fasterxml.jackson.databind.annotation.JsonSerialize";
-  static final String JACKSON_ANNOTATIONS_INSIDE = "com.fasterxml.jackson.annotation.JacksonAnnotationsInside";
+  static final String JACKSON_TYPE_INFO = UnshadeJackson.qualify("annotation.JsonTypeInfo");
+  static final String JACKSON_DESERIALIZE = UnshadeJackson.qualify("databind.annotation.JsonDeserialize");
+  static final String JACKSON_SERIALIZE = UnshadeJackson.qualify("databind.annotation.JsonSerialize");
+  static final String JACKSON_ANNOTATIONS_INSIDE = UnshadeJackson.qualify("annotation.JacksonAnnotationsInside");
   static final String PARCELABLE_INTERFACE_TYPE = "android.os.Parcelable";
   static final String PARCELABLE_CREATOR_FIELD = "CREATOR";
 }

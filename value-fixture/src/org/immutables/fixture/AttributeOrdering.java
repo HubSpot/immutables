@@ -52,12 +52,11 @@ public interface AttributeOrdering {
   }
 
   @Value.Immutable
-  public abstract class SourceOrderingEntity implements InheritedInterface {
+  abstract class SourceOrderingEntity implements InheritedInterface {
 
     public abstract int z();
 
     @Override
     public abstract int y();
   }
-
 }

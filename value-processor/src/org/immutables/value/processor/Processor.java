@@ -46,6 +46,7 @@ import java.util.Set;
     FactoryMirror.QUALIFIED_NAME,
     FConstructorMirror.QUALIFIED_NAME,
     FBuilderMirror.QUALIFIED_NAME,
+    VBuilderMirror.QUALIFIED_NAME,
     FIncludeMirror.QUALIFIED_NAME,
     EncodingMirror.QUALIFIED_NAME,
     CriteriaMirror.QUALIFIED_NAME,
@@ -98,6 +99,7 @@ public final class Processor extends AbstractGenerator {
 
   private void prepareOptions() {
     UnshadeGuava.overridePrefix(processing().getOptions().get(GUAVA_PREFIX));
+    UnshadeGuava.overridePrefix(processing().getOptions().get(JACKSON_PREFIX));
   }
 
   @Override
@@ -109,6 +111,7 @@ public final class Processor extends AbstractGenerator {
 
   private static final String GRADLE_INCREMENTAL = "immutables.gradle.incremental";
   private static final String GUAVA_PREFIX = "immutables.guava.prefix";
+  private static final String JACKSON_PREFIX = "immutables.jackson.prefix";
 
   @Override
   public Set<String> getSupportedOptions() {
@@ -118,6 +121,7 @@ public final class Processor extends AbstractGenerator {
       options.add("org.gradle.annotation.processing.isolating");
     }
     options.add(GUAVA_PREFIX);
+    options.add(JACKSON_PREFIX);
     return options.build();
   }
 
